@@ -3,141 +3,129 @@ import json
 import discord
 import requests
 import uuid
-import traceback
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import asyncio
 from threading import Thread
 import time
 
-# Set up async loop
+# Async event loop setup
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
-# Load environment variables
+# Load env vars
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_NUMBERS = os.getenv("ALLOWED_NUMBERS", "").split(",")
 PROJECT_ID = os.getenv("TELERIVET_PROJECT_ID")
 API_KEY = os.getenv("TELERIVET_API_KEY")
+PHONE_ID = os.getenv("TELERIVET_PHONE_ID")
+CHANNEL_MAP = json.loads(os.getenv("CHANNEL_MAP", "{}"))  # JSON string of {"prefix": "channel_id"}
+NUMBER_MAP = json.loads(os.getenv("NUMBER_MAP", "{}"))    # JSON string of {"+911234567890": "prefix"}
 
-# Flask app and Discord bot
-app = Flask(__name__)
+# Discord client setup
 intents = discord.Intents.default()
 intents.messages = True
 client = discord.Client(intents=intents)
 
-# Number-to-channel mapping
-NUMBER_MAP = {
-    "+911234567890": 123456789012345678,  # Replace with actual values
-}
+# Flask app
+app = Flask(__name__)
 
-# Context tracking map
-context_map = {}
-
+# Handle incoming SMS
 @app.route("/incoming", methods=["POST"])
-def incoming_sms():
+def incoming():
     try:
-        # Parse incoming JSON or form data
         if request.is_json:
             data = request.get_json()
         else:
             data = request.form.to_dict()
 
-        print("📥 Incoming data:", data)
+        print("Incoming SMS Data:", data)
 
-        from_number = data.get("from") or data.get("phone_number") or ""
-        content = data.get("content") or data.get("message") or ""
-        context = data.get("context", None)
+        phone = data.get("from_number") or data.get("from")
+        content = data.get("content") or data.get("message")
 
-        from_number = from_number.strip()
-        content = content.strip()
+        if not phone or not content:
+            return jsonify({"error": "Missing fields"}), 400
 
-        if not from_number or not content:
-            return jsonify({"error": "Missing 'from' or 'content'"}), 400
+        if phone not in ALLOWED_NUMBERS:
+            return jsonify({"error": "Unauthorized number"}), 403
 
-        if from_number not in ALLOWED_NUMBERS:
-            return jsonify({"error": "unauthorized"}), 403
+        prefix = NUMBER_MAP.get(phone)
+        if not prefix:
+            return jsonify({"error": "Prefix not found"}), 400
 
-        channel_id = NUMBER_MAP.get(from_number)
+        channel_id = CHANNEL_MAP.get(prefix)
         if not channel_id:
-            return jsonify({"error": "unknown number"}), 400
+            return jsonify({"error": "Channel not mapped"}), 400
 
-        async def send_to_discord():
-            channel = client.get_channel(channel_id)
-            if channel:
-                msg = await channel.send(f"📩 SMS from {from_number}:\n{content}")
-                if context:
-                    context_map[str(msg.id)] = from_number
-            else:
-                print("❌ Channel not found for ID:", channel_id)
+        channel = client.get_channel(int(channel_id))
+        if not channel:
+            return jsonify({"error": "Channel not found"}), 404
 
-        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(send_to_discord()))
-        return jsonify({"success": True}), 200
+        asyncio.run_coroutine_threadsafe(channel.send(f"[{phone}]\n{content}"), loop)
+
+        return jsonify({"status": "success"}), 200
 
     except Exception as e:
-        print("❗ Exception in /incoming")
-        traceback.print_exc()
-        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+        print("❌ Flask exception:", e)
+        return jsonify({"error": str(e)}), 500
 
+# SMSSync fetch endpoint
 @app.route("/fetch", methods=["POST", "PUT"])
-def fetch_sms():
-    messages_to_send = []
+def fetch():
+    try:
+        # Pull from queue or however you're implementing outbound
+        # For now, dummy message:
+        return jsonify([{
+            "to": "+911234567890",
+            "message": "This is a test reply from Discord.",
+            "uuid": str(uuid.uuid4())
+        }]), 200
+    except Exception as e:
+        print("❌ Fetch error:", e)
+        return jsonify([]), 200  # Return empty list on error
 
-    for msg_id, number in context_map.items():
-        messages_to_send.append({
-            "to": number,
-            "message": f"Reply to Discord msg ID {msg_id}"
-        })
-
-    context_map.clear()
-    return jsonify(messages_to_send)
-
+# Discord background task
 @client.event
 async def on_ready():
-    print(f"✅ Logged in as {client.user}")
+    print(f"✅ Discord bot logged in as {client.user}")
 
 @client.event
 async def on_message(message):
-    if message.author == client.user:
+    if message.author.bot:
         return
 
-    to_number = None
-    if str(message.channel.id) in context_map:
-        to_number = context_map[str(message.channel.id)]
-    else:
-        # Fallback to NUMBER_MAP
-        for number, chan_id in NUMBER_MAP.items():
-            if chan_id == message.channel.id:
-                to_number = number
-                break
+    # Find matching prefix
+    for prefix, channel_id in CHANNEL_MAP.items():
+        if message.channel.id == int(channel_id):
+            # Find matching number
+            for number, num_prefix in NUMBER_MAP.items():
+                if num_prefix == prefix:
+                    send_sms(number, f"[{message.author.name}] {message.content}")
+                    break
 
-    if not to_number:
-        return
-
-    payload = {
-        "to_number": to_number,
-        "content": f"{message.author.name}: {message.content}"
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Basic {API_KEY}"
-    }
-
+def send_sms(to_number, message):
     try:
-        response = requests.post(
-            f"https://api.telerivet.com/v1/projects/{PROJECT_ID}/messages/send",
-            headers=headers,
-            data=json.dumps(payload)
-        )
-        print("📤 Sent SMS:", response.status_code, response.text)
+        print(f"➡️ Sending SMS to {to_number}: {message}")
+        url = f"https://api.telerivet.com/v1/projects/{PROJECT_ID}/messages/send"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "to_number": to_number,
+            "content": message,
+            "phone_id": PHONE_ID
+        }
+        response = requests.post(url, headers=headers, auth=(API_KEY, ""), json=payload)
+        print("Telerivet response:", response.text)
     except Exception as e:
-        print("❗ Error sending SMS:", e)
+        print("❌ Error sending SMS:", e)
 
+# Start Flask server in separate thread
 def run_flask():
     app.run(host="0.0.0.0", port=5000)
 
-if __name__ == "__main__":
-    Thread(target=run_flask).start()
-    client.run(BOT_TOKEN)
+flask_thread = Thread(target=run_flask)
+flask_thread.start()
+
+# Start Discord bot
+client.run(BOT_TOKEN)
