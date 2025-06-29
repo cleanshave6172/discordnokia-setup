@@ -119,7 +119,7 @@ def incoming():
         resolved = NUMBER_MAP.get(target, target)
 
         print(f"📤 Resolving target: {resolved} => {msg}")
-        asyncio.run_coroutine_threadsafe(send_to_discord(resolved, msg), client.loop)
+        asyncio.run_coroutine_threadsafe(send_to_discord(resolved, msg), loop)
 
         return ("Message accepted", 200)
 
@@ -164,4 +164,4 @@ def start_flask():
 
 if __name__ == "__main__":
     Thread(target=start_flask).start()
-    client.run(BOT_TOKEN)
+    loop.run_until_complete(client.start(BOT_TOKEN))
