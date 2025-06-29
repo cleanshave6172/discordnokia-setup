@@ -8,39 +8,50 @@ from dotenv import load_dotenv
 import asyncio
 from threading import Thread
 import time
+import traceback
 
+# Set up asyncio loop
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
-# Load env vars
+# Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_NUMBERS = os.getenv("ALLOWED_NUMBERS", "").split(",")
 PROJECT_ID = os.getenv("TELERIVET_PROJECT_ID")
 API_KEY = os.getenv("TELERIVET_API_KEY")
 PHONE_ID = os.getenv("TELERIVET_PHONE_ID")
+TARGET_PHONE_NUMBER = os.getenv("TARGET_PHONE_NUMBER")
 
-# Safe-load mapping for target names or IDs
+# Validate critical env vars
+required_envs = {
+    "BOT_TOKEN": BOT_TOKEN,
+    "PROJECT_ID": PROJECT_ID,
+    "API_KEY": API_KEY,
+    "PHONE_ID": PHONE_ID,
+    "TARGET_PHONE_NUMBER": TARGET_PHONE_NUMBER,
+}
+missing = [k for k, v in required_envs.items() if not v]
+if missing:
+    raise RuntimeError(f"❌ Missing required environment variables: {', '.join(missing)}")
+
+# Load number map safely
 try:
     NUMBER_MAP = json.loads(os.getenv("NUMBER_MAP", "{}"))
 except Exception as e:
     print(f"❌ Invalid NUMBER_MAP: {e}")
     NUMBER_MAP = {}
 
-# Target phone for SMS delivery
-TARGET_PHONE_NUMBER = os.getenv("TARGET_PHONE_NUMBER")
-
-# Flask app
+# Flask app setup
 app = Flask(__name__)
 
-# Discord bot setup
+# Discord setup
 intents = discord.Intents.default()
 intents.message_content = True
 intents.dm_messages = True
 client = discord.Client(intents=intents)
 discord_ready = asyncio.Event()
 
-# Discord events
 @client.event
 async def on_ready():
     print(f"✅ Discord bot logged in as {client.user}")
@@ -51,7 +62,6 @@ async def on_message(message):
     if message.author == client.user:
         return
 
-    # Compose message
     if isinstance(message.channel, discord.DMChannel):
         content = f"[DM] {message.author.name}: {message.content}"
     else:
@@ -63,7 +73,7 @@ async def on_message(message):
     else:
         print("❌ TARGET_PHONE_NUMBER not set.")
 
-# Send SMS via Telerivet API with increased timeout and retries
+# Telerivet SMS sender
 def send_sms_via_telerivet(to_number, message):
     url = f"https://api.telerivet.com/v1/projects/{PROJECT_ID}/messages/send"
     payload = {
@@ -71,14 +81,13 @@ def send_sms_via_telerivet(to_number, message):
         "content": message,
         "phone_id": PHONE_ID
     }
-
     headers = {
-        'Content-Type': 'application/json'  # Corrected to application/json
+        'Content-Type': 'application/json'
     }
 
     max_retries = 3
-    retry_delay = 5  # Seconds
-    timeout = 30  # Increase timeout to 30 seconds
+    retry_delay = 5
+    timeout = 30
 
     for attempt in range(max_retries):
         try:
@@ -89,25 +98,20 @@ def send_sms_via_telerivet(to_number, message):
             else:
                 print(f"❌ Telerivet error {response.status_code}: {response.text}")
         except requests.exceptions.Timeout:
-            print(f"⏱️ Timeout error on attempt {attempt + 1}. Retrying in {retry_delay} seconds...")
+            print(f"⏱️ Timeout on attempt {attempt + 1}. Retrying in {retry_delay}s...")
         except requests.exceptions.RequestException as e:
-            print(f"❌ Request error: {e}")
-
-        time.sleep(retry_delay)  # Wait before retrying
-
+            print(f"❌ Request exception: {e}")
+        time.sleep(retry_delay)
     print("❌ Failed to send SMS after retries.")
 
-# Webhook to receive SMS from Telerivet (Telerivet service must post here)
+# Incoming webhook route
 @app.route("/incoming", methods=["POST"])
 def incoming():
     try:
-        # Log headers and raw data
         print("Request Headers:", request.headers)
         print("Raw Data:", request.data)
 
-        # Force parsing JSON or fallback to form data if JSON is not available
         data = request.get_json(force=True) or request.form.to_dict()
-
         if not data:
             print("❌ No data received or malformed request")
             return "Invalid content", 415
@@ -119,7 +123,7 @@ def incoming():
 
         if not content or " " not in content:
             print(f"❌ Invalid format or missing content: {content}")
-            return ("Invalid format. Use: target message", 400)
+            return "Invalid format. Use: target message", 400
 
         target, msg = content.split(" ", 1)
         target = target.lstrip("@")
@@ -128,16 +132,17 @@ def incoming():
         print(f"📤 Resolving target: {resolved} => {msg}")
         asyncio.run_coroutine_threadsafe(send_to_discord(resolved, msg), client.loop)
 
-        return ("Message accepted", 200)
+        return "Message accepted", 200
 
     except KeyError as e:
-        print(f"❌ Missing expected key in incoming data: {e}")
+        print(f"❌ Missing expected key: {e}")
         return "Bad request", 400
     except Exception as e:
-        print(f"❌ Error processing incoming data: {e}")
+        print(f"❌ Exception in /incoming: {e}")
+        print(traceback.format_exc())
         return "Internal server error", 500
 
-# Send message to Discord from SMS
+# Async function to forward message to Discord
 async def send_to_discord(resolved, msg):
     await discord_ready.wait()
     try:
@@ -147,11 +152,13 @@ async def send_to_discord(resolved, msg):
                 await channel.send(msg)
                 print(f"📤 Sent to channel #{channel.name} (ID: {resolved})")
                 return
-
-            user = await client.fetch_user(int(resolved))
-            await user.send(msg)
-            print(f"📤 Sent DM to user {user.name} (ID: {resolved})")
-            return
+            try:
+                user = await client.fetch_user(int(resolved))
+                await user.send(msg)
+                print(f"📤 Sent DM to user {user.name} (ID: {resolved})")
+                return
+            except discord.NotFound:
+                print(f"❌ User ID {resolved} not found")
         else:
             for guild in client.guilds:
                 channel = discord.utils.get(guild.channels, name=resolved)
@@ -159,17 +166,30 @@ async def send_to_discord(resolved, msg):
                     await channel.send(msg)
                     print(f"📤 Sent to channel #{channel.name} (by name)")
                     return
-
-        print(f"❌ Could not find channel or user: {resolved}")
-
+        print(f"❌ Could not resolve: {resolved}")
     except Exception as e:
         print(f"❌ Error sending to Discord: {e}")
+        print(traceback.format_exc())
 
-# Start Flask in thread
+# Global error handler
+@app.errorhandler(Exception)
+def handle_exception(e):
+    print("❌ Flask exception:", traceback.format_exc())
+    return jsonify({"error": "Internal Server Error"}), 500
+
+# Start Flask in separate thread
 def start_flask():
     port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
+    try:
+        app.run(host="0.0.0.0", port=port, use_reloader=False)
+    except Exception as e:
+        print(f"❌ Failed to start Flask: {e}")
+        print(traceback.format_exc())
 
 if __name__ == "__main__":
     Thread(target=start_flask).start()
-    client.run(BOT_TOKEN)
+    try:
+        client.run(BOT_TOKEN)
+    except Exception as e:
+        print(f"❌ Failed to run Discord client: {e}")
+        print(traceback.format_exc())
