@@ -1,131 +1,67 @@
-import os
-import json
-import discord
-import requests
-import uuid
 from flask import Flask, request, jsonify
-from dotenv import load_dotenv
+import discord
 import asyncio
-from threading import Thread
-import time
+import os
 
-# Async event loop setup
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
-# Load env vars
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ALLOWED_NUMBERS = os.getenv("ALLOWED_NUMBERS", "").split(",")
-PROJECT_ID = os.getenv("TELERIVET_PROJECT_ID")
-API_KEY = os.getenv("TELERIVET_API_KEY")
-PHONE_ID = os.getenv("TELERIVET_PHONE_ID")
-CHANNEL_MAP = json.loads(os.getenv("CHANNEL_MAP", "{}"))  # JSON string of {"prefix": "channel_id"}
-NUMBER_MAP = json.loads(os.getenv("NUMBER_MAP", "{}"))    # JSON string of {"+911234567890": "prefix"}
-
-# Discord client setup
-intents = discord.Intents.default()
-intents.messages = True
-client = discord.Client(intents=intents)
-
-# Flask app
 app = Flask(__name__)
 
-# Handle incoming SMS
+# Prefix → Channel ID (all values as strings)
+PREFIX_CHANNEL_MAP = {
+    "abdu": "702388818770133023",
+    "essa": "634430242089467904",
+    "silver": "829356590452047884",
+    "nova": "462623701788262400",
+    "test": "466528311351312384",
+    "as": "1386286796878385224",
+    "king": "1218362669552238702"
+}
+
+# Optional: precompute valid channel IDs
+VALID_CHANNEL_IDS = set(PREFIX_CHANNEL_MAP.values())
+
 @app.route("/incoming", methods=["POST"])
 def incoming():
     try:
-        if request.is_json:
-            data = request.get_json()
+        data = request.get_json(force=True)
+        from_number = data.get("from_number")
+        sms_body = data.get("content", "").strip()
+
+        print(f"Incoming SMS: {sms_body}")
+
+        try:
+            target, message = sms_body.split(" ", 1)
+        except ValueError:
+            return jsonify({"error": "Missing message content"}), 400
+
+        # Check if it's a known prefix
+        if target in PREFIX_CHANNEL_MAP:
+            channel_id = int(PREFIX_CHANNEL_MAP[target])
         else:
-            data = request.form.to_dict()
+            try:
+                # Fallback: treat as raw channel ID
+                if target in VALID_CHANNEL_IDS:
+                    channel_id = int(target)
+                else:
+                    return jsonify({"error": "Prefix not found"}), 400
+            except ValueError:
+                return jsonify({"error": "Invalid channel ID"}), 400
 
-        print("Incoming SMS Data:", data)
+        # Send to Discord
+        asyncio.run_coroutine_threadsafe(
+            send_to_discord(channel_id, f"[{from_number}] {message}"),
+            loop=asyncio.get_event_loop()
+        )
 
-        phone = data.get("from_number") or data.get("from")
-        content = data.get("content") or data.get("message")
-
-        if not phone or not content:
-            return jsonify({"error": "Missing fields"}), 400
-
-        if phone not in ALLOWED_NUMBERS:
-            return jsonify({"error": "Unauthorized number"}), 403
-
-        prefix = NUMBER_MAP.get(phone)
-        if not prefix:
-            return jsonify({"error": "Prefix not found"}), 400
-
-        channel_id = CHANNEL_MAP.get(prefix)
-        if not channel_id:
-            return jsonify({"error": "Channel not mapped"}), 400
-
-        channel = client.get_channel(int(channel_id))
-        if not channel:
-            return jsonify({"error": "Channel not found"}), 404
-
-        asyncio.run_coroutine_threadsafe(channel.send(f"[{phone}]\n{content}"), loop)
-
-        return jsonify({"status": "success"}), 200
+        return jsonify({"success": True}), 200
 
     except Exception as e:
-        print("❌ Flask exception:", e)
+        print(f"Error in /incoming: {e}")
         return jsonify({"error": str(e)}), 500
 
-# SMSSync fetch endpoint
-@app.route("/fetch", methods=["POST", "PUT"])
-def fetch():
-    try:
-        # Pull from queue or however you're implementing outbound
-        # For now, dummy message:
-        return jsonify([{
-            "to": "+911234567890",
-            "message": "This is a test reply from Discord.",
-            "uuid": str(uuid.uuid4())
-        }]), 200
-    except Exception as e:
-        print("❌ Fetch error:", e)
-        return jsonify([]), 200  # Return empty list on error
-
-# Discord background task
-@client.event
-async def on_ready():
-    print(f"✅ Discord bot logged in as {client.user}")
-
-@client.event
-async def on_message(message):
-    if message.author.bot:
-        return
-
-    # Find matching prefix
-    for prefix, channel_id in CHANNEL_MAP.items():
-        if message.channel.id == int(channel_id):
-            # Find matching number
-            for number, num_prefix in NUMBER_MAP.items():
-                if num_prefix == prefix:
-                    send_sms(number, f"[{message.author.name}] {message.content}")
-                    break
-
-def send_sms(to_number, message):
-    try:
-        print(f"➡️ Sending SMS to {to_number}: {message}")
-        url = f"https://api.telerivet.com/v1/projects/{PROJECT_ID}/messages/send"
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "to_number": to_number,
-            "content": message,
-            "phone_id": PHONE_ID
-        }
-        response = requests.post(url, headers=headers, auth=(API_KEY, ""), json=payload)
-        print("Telerivet response:", response.text)
-    except Exception as e:
-        print("❌ Error sending SMS:", e)
-
-# Start Flask server in separate thread
-def run_flask():
-    app.run(host="0.0.0.0", port=5000)
-
-flask_thread = Thread(target=run_flask)
-flask_thread.start()
-
-# Start Discord bot
-client.run(BOT_TOKEN)
+# Replace this with your actual bot coroutine
+async def send_to_discord(channel_id, message):
+    channel = bot.get_channel(channel_id)
+    if channel:
+        await channel.send(message)
+    else:
+        print(f"Channel not found: {channel_id}")
