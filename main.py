@@ -77,7 +77,7 @@ async def on_ready():
     print(f"Logged in as {client.user}!")
 
 def run_flask():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
 
 # Start both Flask and Discord
 if __name__ == "__main__":
