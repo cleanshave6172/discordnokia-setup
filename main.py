@@ -9,117 +9,98 @@ import asyncio
 from threading import Thread
 import time
 
-# Setup
+# Set up the asyncio event loop
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
-# Load .env
+# Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_NUMBERS = os.getenv("ALLOWED_NUMBERS", "").split(",")
 PROJECT_ID = os.getenv("TELERIVET_PROJECT_ID")
 API_KEY = os.getenv("TELERIVET_API_KEY")
-DISCORD_CHANNEL_PREFIXES = json.loads(os.getenv("CHANNEL_PREFIXES", "{}"))
+TELERIVET_URL = f"https://api.telerivet.com/v1/projects/{PROJECT_ID}/messages/send"
 
-# Discord Client
+# Set up Flask app and Discord client
+app = Flask(__name__)
 intents = discord.Intents.default()
 intents.messages = True
 client = discord.Client(intents=intents)
 
-# Flask App
-app = Flask(__name__)
-app.config["DEBUG"] = True  # Show detailed errors in logs
+# Prefix mapping and active message tracking
+prefix_map = {}
+active_messages = {}
 
-# Discord Ready
+@app.route('/incoming', methods=['POST'])
+def incoming_sms():
+    data = request.form if request.form else request.get_json()
+    number = data.get("from_number")
+    content = data.get("content")
+
+    if number not in ALLOWED_NUMBERS:
+        return jsonify({"error": "unauthorized"}), 403
+
+    if content and ":" in content:
+        prefix, msg = content.split(":", 1)
+        prefix = prefix.strip().lower()
+        msg = msg.strip()
+
+        channel_id = prefix_map.get(prefix)
+        if channel_id:
+            future = asyncio.run_coroutine_threadsafe(send_to_discord(channel_id, msg), loop)
+            message = future.result()
+            active_messages[number] = (prefix, message.id)
+            return jsonify({"status": "sent"}), 200
+        else:
+            return jsonify({"error": "unknown prefix"}), 400
+    else:
+        # Reply to last used channel
+        if number in active_messages:
+            prefix, last_message_id = active_messages[number]
+            channel_id = prefix_map.get(prefix)
+            if channel_id:
+                reply = f"Reply from {number}: {content}"
+                future = asyncio.run_coroutine_threadsafe(send_to_discord(channel_id, reply), loop)
+                future.result()
+                return jsonify({"status": "sent"}), 200
+        return jsonify({"error": "no context"}), 400
+
+async def send_to_discord(channel_id, content):
+    channel = client.get_channel(int(channel_id))
+    if channel:
+        return await channel.send(content)
+    return None
+
+def send_sms(number, message):
+    payload = {
+        "to_number": number,
+        "content": message
+    }
+    response = requests.post(TELERIVET_URL, auth=(API_KEY, ''), json=payload)
+    return response.status_code == 200
+
 @client.event
 async def on_ready():
-    print(f"✅ Discord bot logged in as {client.user}")
+    print(f"Logged in as {client.user}")
 
-# Discord Message Listener
 @client.event
 async def on_message(message):
-    if message.author == client.user:
+    if message.author == client.user or not message.guild:
         return
 
-    for prefix, number in DISCORD_CHANNEL_PREFIXES.items():
-        if message.channel.name.startswith(prefix):
-            if number in ALLOWED_NUMBERS:
-                send_sms(number, f"{message.author.name}: {message.content}")
-                print(f"✅ Sent to {number}: {message.content}")
+    for prefix, channel_id in prefix_map.items():
+        if int(channel_id) == message.channel.id:
+            for number in ALLOWED_NUMBERS:
+                send_sms(number, f"{prefix}: {message.content}")
             break
 
-# SMS sending
-def send_sms(phone_number, message):
-    if not PROJECT_ID or not API_KEY:
-        print("❌ Telerivet config missing.")
-        return
+# Run Discord bot in separate thread
+def run_discord_bot():
+    client.run(BOT_TOKEN)
 
-    url = f"https://api.telerivet.com/v1/projects/{PROJECT_ID}/messages/send"
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "content": message,
-        "to_number": phone_number
-    }
+discord_thread = Thread(target=run_discord_bot)
+discord_thread.start()
 
-    response = requests.post(url, auth=(API_KEY, ''), headers=headers, json=payload)
-    print(f"📤 SMS sent status: {response.status_code}, body: {response.text}")
-
-# Webhook: SMS → Discord
-@app.route('/incoming', methods=['POST'])
-def incoming():
-    try:
-        data = request.form.to_dict() or request.get_json(silent=True) or {}
-        print("📥 Incoming data:", data)
-
-        phone = data.get("from_number")
-        message = data.get("content")
-
-        if phone not in ALLOWED_NUMBERS:
-            return "Unauthorized", 403
-
-        # Find correct channel
-        matched_prefix = None
-        for prefix, number in DISCORD_CHANNEL_PREFIXES.items():
-            if number == phone:
-                matched_prefix = prefix
-                break
-
-        if not matched_prefix:
-            return "No channel match", 404
-
-        channel = discord.utils.get(client.get_all_channels(), name=f"{matched_prefix}")
-        if channel:
-            loop.create_task(channel.send(f"📲 SMS from {phone}: {message}"))
-            return "OK", 200
-        else:
-            print("❌ Channel not found for prefix", matched_prefix)
-            return "Channel not found", 404
-
-    except Exception as e:
-        print("❌ Exception in /incoming:", e)
-        return "Internal Server Error", 500
-
-# Optional: for SMSSync /fetch
-@app.route('/fetch', methods=['GET', 'POST', 'PUT'])
-def fetch_sms():
-    try:
-        return jsonify([]), 200  # SMSSync needs empty list if no message
-    except Exception as e:
-        print("❌ Exception in /fetch:", e)
-        return "Internal Server Error", 500
-
-# Prevent 500 on "/"
-@app.route("/")
-def home():
-    return "✅ Discord SMS bridge is running", 200
-
-# Flask in thread
-def run_flask():
-    app.run(host="0.0.0.0", port=5000)
-
-# Start Flask server in thread
-flask_thread = Thread(target=run_flask)
-flask_thread.start()
-
-# Run Discord bot
-client.run(BOT_TOKEN)
+# Run Flask app
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
